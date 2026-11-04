@@ -1,0 +1,328 @@
+---
+title: "scRNA-seq of primary human CD3+CD8+ SA-βGal low and high T cells"
+author: "Paolo S Turano"
+date: "2025-10-09"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+    number_sections: false
+    code_folding: show
+    code_download: true
+    fig_width: 10
+    fig_height: 8
+    df_print: paged
+editor_options:
+  chunk_output_type: inline
+---
+
+This R Markdown documents the scRNA-seq analysis of primary human CD3+ CD8+ T cells generated in this study. CD8+ T cells from two healthy donors were stained with SPiDER-βGal and separated by FACS into SA-βGal low and SA-βGal high populations within four differentiation subsets defined by CCR7 and CD45RA expression: naïve (TN), central memory (TCM), effector memory (TEM), and terminally differentiated effector memory (TEMRA). Approximately equal numbers of SA-βGal low and SA-βGal high cells were sorted from each subset to ensure balanced representation of both SA-βGal states and all four differentiation subsets. For each donor, equal numbers of cells from the four differentiation subsets were pooled separately according to SA-βGal status, generating four samples (two donors × two SA-βGal conditions) for scRNA-seq using the 10x Genomics platform. This experimental design enabled direct transcriptional comparisons between SA-βGal low and SA-β-Gal high cells across differentiation states, rather than reflecting their physiological frequencies in peripheral blood.
+
+```{r message=FALSE, warning=FALSE}
+library(Seurat)
+library(SeuratExtend)
+library(dplyr)
+library(patchwork)
+library(tidyverse)
+library(irGSEA)
+library(ggplot2)
+library(viridis)
+library(scCustomize)
+library(tibble)
+library(future)
+library(eulerr)
+library(remotes)
+library(harmony)
+```
+
+# 1. Data preparation
+
+## 1.1 Import raw count matrices
+
+Raw gene expression count matrices using the 10x Genomics Cell Ranger pipeline were imported separately for each donor and SA-βGal status.
+
+```{r directories}
+main_dir <- "/Volumes/Extreme_Pro/PhD_UH/CD8_Senescence/Sequencing/single_cell_paolo"
+
+sample_dir <- file.path(main_dir, "cell_ranger_output", "GEX")
+
+high_1 <- Read10X(file.path(sample_dir, "1_high"))
+low_1  <- Read10X(file.path(sample_dir, "1_low"))
+high_2 <- Read10X(file.path(sample_dir, "2_high"))
+low_2  <- Read10X(file.path(sample_dir, "2_low"))
+```
+
+## 1.2 Create and merge Seurat objcets 
+
+Individual Seurat objects were generated for each sample, retaining genes detected in at least three cells and cells expressing at least 200 genes. The four samples were subsequently merged, preserving their original sample identities.
+
+```{r read barcodes, features(genes) and matrix files}
+high_1 <- CreateSeuratObject(counts = high_1, project = "high_1", min.cells = 3, min.features = 200)
+low_1 <- CreateSeuratObject(counts = low_1, project = "low_1", min.cells = 3, min.features = 200)
+high_2 <- CreateSeuratObject(counts = high_2, project = "high_2", min.cells = 3, min.features = 200)
+low_2 <- CreateSeuratObject(counts = low_2, project = "low_2", min.cells = 3, min.features = 200)
+
+MergedCD8 <- merge(x = high_1, y = c(high_2, low_1, low_2),
+                   add.cell.ids = c("high_1", "high_2", "low_1", "low_2"),
+                   project = "MergedCD8")
+```
+
+## 1.3 Quality control and cell filtering
+Quality control was performed on the merged dataset to remove low-quality cells and potential doublets based on the number of detected genes (`nFeature_RNA`), total UMI counts (`nCount_RNA`), and percentage of mitochondrial transcripts (`percent.mt`).
+
+The percentage of mitochondrial transcripts was calculated using genes beginning with `MT-`.
+
+```{r strore mitochondrial data}
+MergedCD8 <- PercentageFeatureSet(MergedCD8, pattern = "^MT-", col.name = "percent.mt")
+range(MergedCD8$percent.mt)
+```
+
+### Quality control before filtering
+The distributions of detected genes, total UMI counts, and mitochondrial transcript percentages were examined before filtering.
+
+```{r visualize QC parametrs}
+p1 <- VlnPlot(MergedCD8, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+p1
+```
+
+### Cell filtering
+Cells were retained if they expressed more than 500 and fewer than 4,000 genes, contained fewer than 20,000 total UMI counts, and had less than 10% mitochondrial transcripts.
+
+```{r}
+MergedCD8 <- subset(MergedCD8, subset = nFeature_RNA > 500 & nFeature_RNA < 4000 & nCount_RNA < 20000 & percent.mt < 10)
+```
+
+### Quality control after filtering
+The same quality control metrics were visualized after filtering to assess the retained cell population.
+
+```{r}
+p2 <- VlnPlot(MergedCD8, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+p2
+```
+
+## 1.4 Data normalization and variable feature selection
+
+Following quality control, gene expression counts were normalized using Seurat's `LogNormalize` method with a scale factor of 10,000. The 2,000 most variable genes were subsequently identified using the variance-stabilizing transformation (`vst`) method.
+
+```{r normalization}
+MergedCD8 <- NormalizeData(MergedCD8, normalization.method = "LogNormalize", scale.factor = 10000)
+MergedCD8 <- FindVariableFeatures(MergedCD8, selection.method = "vst", nfeatures = 2000)
+```
+
+## 1.5 Data scaling and principal component analysis
+Gene expression values were centered and scaled across all genes. Principal component analysis (PCA) was subsequently performed using the 2,000 highly variable genes identified above.
+
+The first 20 principal components were retained for downstream Harmony integration.
+
+```{r scaling-pca}
+MergedCD8 <- ScaleData( MergedCD8, features = rownames(MergedCD8))
+
+MergedCD8 <- RunPCA(MergedCD8, features = VariableFeatures(MergedCD8), npcs = 20, verbose = FALSE)
+```
+
+## 1.6 PCA dimensionality assessment
+The standard deviations of the principal components were examined to assess the contribution of successive dimensions. Twenty PCs were selected for downstream analysis.
+
+```{r pca-elbow, fig.width=8, fig.height=5}
+ElbowPlot(MergedCD8, ndims = 50)
+```
+
+## 1.7 Pre-integration UMAP visualization
+
+Before Harmony integration, UMAP was performed using the first 20 principal components to examine the distribution of cells across donors and SA-βGal conditions. These visualizations were used to assess potential donor-associated batch effects and biological differences prior to correction.
+
+```{r pre-integration-umap}
+MergedCD8 <- RunUMAP(MergedCD8, reduction = "pca", dims = 1:20)
+
+MergedCD8$donor <- ifelse(MergedCD8$orig.ident %in% c("high_1", "low_1"),"donor_1", "donor_2")
+MergedCD8$condition <- ifelse(MergedCD8$orig.ident %in% c("high_1", "high_2"), "high", "low")
+```
+
+### Visualization by donor and SA-βGal condition
+
+```{r pre-integration-plots, fig.width=12, fig.height=5}
+senescence_state_colors <- c("high" = "#E31A1C","low" = "#1F78B4")
+
+batch_colors <- c("donor_1" = "purple","donor_2" = "orange")
+
+p_donor <- DimPlot(MergedCD8, reduction = "umap", group.by = "donor", cols = batch_colors) + ggtitle("Before Harmony: donor")
+
+p_condition <- DimPlot(MergedCD8, reduction = "umap", group.by = "condition", cols = senescence_state_colors) + ggtitle("Before Harmony: SA-βGal")
+
+p_donor + p_condition
+```
+
+## 1.8 Harmony integration
+To account for donor-associated variation while preserving transcriptional differences associated with SA-βGal status, Harmony integration was performed using donor identity as the batch variable. A diversity penalty parameter (`theta`) of 5 was applied to encourage donor mixing across transcriptional populations.
+
+```{r harmony-integration}
+H_merged <- RunHarmony(MergedCD8, group.by.vars = "donor", theta = 5)
+```
+
+## 1.9 Harmony-based dimensionality reduction and clustering
+The first six Harmony dimensions were used for UMAP visualization and graph-based clustering. UMAP was performed with 30 neighbors and a minimum distance of 0.1. The nearest-neighbor graph was constructed using the same six Harmony dimensions, and clusters were identified at a resolution of 0.4.
+
+```{r harmony-umap-clustering}
+H_merged <- RunUMAP(H_merged, reduction = "harmony", dims = 1:6, n.neighbors = 30, min.dist = 0.1)
+
+H_merged <- FindNeighbors(H_merged, reduction = "harmony",dims = 1:6)
+
+H_merged <- FindClusters(H_merged, resolution = 0.4)
+```
+
+## 1.10 Visualization of Harmony integrated cells
+The Harmony-integrated UMAP was visualized according to transcriptional cluster identity, SA-βGal status, and donor identity. These visualizations were used to assess the distribution of SA-βGal populations and donor mixing following batch correction.
+
+### Transcriptional clusters
+
+```{r harmony-clusters, fig.width=8, fig.height=6}
+DimPlot(H_merged, reduction = "umap", group.by = "seurat_clusters", label = TRUE, repel = TRUE) + NoLegend()
+```
+
+### SA-βGal status and donor identity
+
+```{r harmony-donor-condition, fig.width=12, fig.height=5}
+p_condition_H <- DimPlot(H_merged, reduction = "umap", group.by = "condition", cols = senescence_state_colors) + ggtitle("After Harmony: SA-βGal")
+
+p_donor_H <- DimPlot(H_merged, reduction = "umap", group.by = "donor", cols = batch_colors) + ggtitle("After Harmony: donor")
+
+p_donor_H + p_condition_H
+```
+
+# 2.0 DEGs
+
+```{r find conserved markers per cluster}
+DEGs <- FindAllMarkers(H_merged, only.pos = FALSE, logfc.threshold = 1)
+
+DEGs %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 10) %>%
+    ungroup() -> top10
+```
+
+# 2.0 Cluster annotation and marker expression
+Transcriptional clusters were annotated based on the expression of established CD8+ T cell differentiation markers. A distinct SA-βGal high effector memory population was identified and annotated separately.
+
+```{r annotate-clusters}
+# Assign biological identities to Harmony clusters
+cluster_rename <- c(
+  "0" = "Naïve",
+  "1" = "EMRA1",
+  "2" = "EM1",
+  "3" = "CM",
+  "4" = "EMRA2",
+  "5" = "SA-βGalhigh EM",
+  "6" = "EM2",
+  "7" = "EMRA3",
+  "8" = "EM1"
+)
+
+# Save annotations as metadata and set identities
+H_merged$cluster <- unname(
+  cluster_rename[as.character(H_merged$RNA_snn_res.0.4)]
+)
+
+cluster_order <- c(
+  "EMRA3", "EMRA2", "EMRA1", "EM2",
+  "SA-βGalhigh EM", "EM1", "CM", "Naïve"
+)
+
+H_merged$cluster <- factor(
+  H_merged$cluster,
+  levels = cluster_order
+)
+
+Idents(H_merged) <- "cluster"
+```
+
+## 2.1 Marker expression across annotated clusters
+The expression of differentiation-associated and cytotoxic effector markers was visualized across the annotated CD8+ T-cell populations.
+
+```{r annotated-cluster-dotplot, fig.width=12, fig.height=4}
+markers.to.plot <- c(
+  "CCR7", "IL7R", "EEF1B2", "NOSIP",
+  "ANXA1", "FXYD5", "GZMK",
+  "KLRB1", "CCR6", "NCR3", "RORA",
+  "CD74", "CCL5", "DUSP4", "GZMA",
+  "JUNB", "FOS", "ACTN1", "KLRC3",
+  "GZMB", "GZMH", "HLA-A", "HLA-B", "B2M"
+)
+
+DP <- DotPlot_scCustom(
+  seurat_object = H_merged,
+  features = markers.to.plot,
+  colors_use = viridis_plasma_dark_high
+)
+
+DP
+```
+
+## 2.2 UMAP visualization of annotated populations
+
+```{r UMAPs}
+#colors for UMAPs
+senescence_state_colors <- c("high" = "#E31A1C", "low" = "#1F78B4")
+cluster_colors <- c("Naïve" = "#F8766D", "CM" = "#D39200", "EM1" = "#7CAE00", "SA-βGalhigh EM" = "#C77CFF", "EM2" = "#00A9FF", "EMRA1" = "#00B9E3", "EMRA2" = "#DB72FB", "EMRA3" = "#FF66C4")
+
+# Clusters
+Idents(H_merged) <- "cluster"
+umap_clusters <- DimPlot(
+  H_merged, reduction = "umap", label = F,
+  raster = TRUE, raster.dpi = c(4096, 4096),  pt.size = 9,
+  cols = cluster_colors
+) + NoLegend() + ggtitle(NULL)
+
+# Senescence status
+umap_senescence <- DimPlot(
+  H_merged, reduction = "umap", label = F,
+  raster = TRUE, group.by = "condition", raster.dpi = c(4096, 4096), pt.size = 9,
+  cols = senescence_state_colors
+) + NoLegend() + ggtitle(NULL)
+
+#umap_donor
+umap_clusters
+umap_senescence
+
+# Export high quality PDFs
+#ggsave( "UMAP_clusters.pdf",umap_clusters, width = 8.2, height = 6.7, device = cairo_pdf)
+#ggsave("UMAP_senescence.pdf", umap_senescence, width = 8.2, height = 6.7, device = cairo_pdf)
+```
+
+## 2.3 Cell counts and percentages by cluster and condition
+
+```{r}
+#clusters
+#set identity
+Idents(H_merged) <- "cluster"
+# see distribution of cells across
+table(Idents(H_merged))
+
+#set identity
+Idents(H_merged) <- "orig.ident"
+# see distribution of cells across
+table(Idents(H_merged))
+
+# cell counts by cluster and orig.ident
+cell_counts_H_merged <- table(H_merged$cluster, H_merged$orig.ident)
+cell_counts_H_merged
+
+#cell counts by sample
+cell_counts_sample <- table(H_merged$orig.ident)
+
+# % table
+cell_percent_H_merged <- prop.table(cell_counts_H_merged, margin=2)
+
+#save % table
+write.csv(cell_percent_H_merged, "V5_cell_percent_H_merged.csv")
+```
+As a final comment, figures generated here were processed using Sketch for publication.
+
+```{r, message=FALSE, warning=FALSE}
+sessionInfo()
+knitr::knit_exit()
+```
